@@ -10,6 +10,8 @@ var cuts = [];
 var layouts = [];
 var activeSheet = 0;
 var cutIdCounter = 0;
+var layoutScale = 1;
+var dragState = null;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', function() {
@@ -19,6 +21,7 @@ document.addEventListener('DOMContentLoaded', function() {
     addCut('Back panel', 900, 600, 1);
     setupDropZone();
     setupCSVInput();
+    setupCanvasInteraction();
     showEmpty();
   } catch(e) {
     console.error('Init error:', e);
@@ -520,12 +523,91 @@ function buildLegend(){
   });
 }
 
+// ─── Canvas interaction ───────────────────────────────────────────────────────
+function setupCanvasInteraction() {
+  var canvas = document.getElementById('layout-canvas');
+  canvas.addEventListener('mousedown', onCanvasMouseDown);
+  canvas.addEventListener('mousemove', onCanvasMouseMove);
+  canvas.addEventListener('mouseup', onCanvasMouseUp);
+  canvas.addEventListener('mouseleave', onCanvasMouseUp);
+  canvas.addEventListener('dblclick', onCanvasDblClick);
+}
+
+function getCanvasPos(canvas, e) {
+  var rect = canvas.getBoundingClientRect();
+  return { x: (e.clientX - rect.left) / layoutScale, y: (e.clientY - rect.top) / layoutScale };
+}
+
+function findPieceAt(pos) {
+  if (!layouts[activeSheet]) return -1;
+  var placed = layouts[activeSheet].placed;
+  for (var i = placed.length - 1; i >= 0; i--) {
+    var p = placed[i];
+    if (pos.x >= p.x && pos.x <= p.x + p.w && pos.y >= p.y && pos.y <= p.y + p.h) return i;
+  }
+  return -1;
+}
+
+function onCanvasMouseDown(e) {
+  if (e.button !== 0 || !layouts[activeSheet]) return;
+  var canvas = document.getElementById('layout-canvas');
+  var pos = getCanvasPos(canvas, e);
+  var idx = findPieceAt(pos);
+  if (idx === -1) return;
+  var p = layouts[activeSheet].placed[idx];
+  dragState = { pieceIdx: idx, offsetX: pos.x - p.x, offsetY: pos.y - p.y };
+  canvas.style.cursor = 'grabbing';
+  e.preventDefault();
+}
+
+function onCanvasMouseMove(e) {
+  var canvas = document.getElementById('layout-canvas');
+  if (!dragState) {
+    var pos = getCanvasPos(canvas, e);
+    canvas.style.cursor = findPieceAt(pos) !== -1 ? 'grab' : 'default';
+    return;
+  }
+  var pos = getCanvasPos(canvas, e);
+  var sw = +document.getElementById('sw').value;
+  var sh = +document.getElementById('sh').value;
+  var p = layouts[activeSheet].placed[dragState.pieceIdx];
+  p.x = Math.max(0, Math.min(sw - p.w, pos.x - dragState.offsetX));
+  p.y = Math.max(0, Math.min(sh - p.h, pos.y - dragState.offsetY));
+  drawSheet(activeSheet, sw, sh);
+}
+
+function onCanvasMouseUp() {
+  if (dragState) {
+    dragState = null;
+    document.getElementById('layout-canvas').style.cursor = 'default';
+  }
+}
+
+function onCanvasDblClick(e) {
+  if (!layouts[activeSheet]) return;
+  var canvas = document.getElementById('layout-canvas');
+  var pos = getCanvasPos(canvas, e);
+  var idx = findPieceAt(pos);
+  if (idx === -1) return;
+  var sw = +document.getElementById('sw').value;
+  var sh = +document.getElementById('sh').value;
+  var p = layouts[activeSheet].placed[idx];
+  var cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+  var newW = p.h, newH = p.w;
+  p.x = Math.max(0, Math.min(sw - newW, cx - newW / 2));
+  p.y = Math.max(0, Math.min(sh - newH, cy - newH / 2));
+  p.w = newW; p.h = newH;
+  p.rotated = !p.rotated;
+  drawSheet(activeSheet, sw, sh);
+}
+
 // ─── Canvas drawing ───────────────────────────────────────────────────────────
 function drawSheet(idx,sw,sh){
   var canvas=document.getElementById('layout-canvas');
   var wrap=document.querySelector('.canvas-area');
   var maxW=wrap.clientWidth-48, maxH=wrap.clientHeight-48;
   var scale=Math.min(maxW/sw, maxH/sh, 1.5);
+  layoutScale=scale;
 
   canvas.width=Math.round(sw*scale); canvas.height=Math.round(sh*scale);
   canvas.style.width=canvas.width+'px'; canvas.style.height=canvas.height+'px';
@@ -728,6 +810,135 @@ function exportPDF(){
   } catch(e){
     console.error('PDF error:',e); toast('PDF error: '+e.message);
   }
+}
+
+// ─── DXF Export ───────────────────────────────────────────────────────────────
+// ACI colors loosely matching the palette (indices 1-15 give distinct colours)
+var DXF_ACI = [1,3,5,6,2,1,4,30,62,10,140,170,58,42,190];
+
+function exportDXF() {
+  if (layouts.length === 0) { toast('Run optimise first'); return; }
+  var sw = +document.getElementById('sw').value;
+  var sh = +document.getElementById('sh').value;
+  var lines = [];
+
+  function w(s) { lines.push(s); }
+
+  // Header
+  w('0'); w('SECTION'); w('2'); w('HEADER');
+  w('9'); w('$ACADVER'); w('1'); w('AC1014');
+  w('9'); w('$INSUNITS'); w('70'); w('4'); // mm
+  w('0'); w('ENDSEC');
+
+  // Tables (minimal — just layer table)
+  w('0'); w('SECTION'); w('2'); w('TABLES');
+  w('0'); w('TABLE'); w('2'); w('LAYER'); w('70'); w(String(cuts.length + 1));
+  // Default layer
+  w('0'); w('LAYER'); w('2'); w('0'); w('70'); w('0'); w('62'); w('7'); w('6'); w('CONTINUOUS');
+  // One layer per cut type
+  cuts.forEach(function(c) {
+    w('0'); w('LAYER');
+    w('2'); w(sanitizeDxfName(c.name || (c.w + 'x' + c.h)));
+    w('70'); w('0');
+    w('62'); w(String(DXF_ACI[c.colorIdx] || 7));
+    w('6'); w('CONTINUOUS');
+  });
+  w('0'); w('ENDTAB'); w('0'); w('ENDSEC');
+
+  // Entities
+  w('0'); w('SECTION'); w('2'); w('ENTITIES');
+
+  var sheetGap = 100; // mm gap between sheets
+
+  layouts.forEach(function(sheet, si) {
+    var offsetX = si * (sw + sheetGap);
+
+    // Sheet border
+    w('0'); w('LWPOLYLINE');
+    w('8'); w('SHEET_BORDER');
+    w('62'); w('7');
+    w('90'); w('4');
+    w('70'); w('1');
+    dxfVertex(w, offsetX, 0);
+    dxfVertex(w, offsetX + sw, 0);
+    dxfVertex(w, offsetX + sw, sh);
+    dxfVertex(w, offsetX, sh);
+
+    // Sheet label
+    w('0'); w('TEXT');
+    w('8'); w('SHEET_BORDER');
+    w('10'); w(fmt(offsetX + 5));
+    w('20'); w(fmt(sh + 10));
+    w('30'); w('0');
+    w('40'); w('20');
+    w('1'); w('Sheet ' + (si + 1) + ' of ' + layouts.length + '  ' + sw + 'x' + sh + 'mm');
+
+    sheet.placed.forEach(function(p) {
+      var layerName = sanitizeDxfName(p.name || (p.w + 'x' + p.h));
+      var aciColor = String(DXF_ACI[p.colorIdx] || 7);
+      var px = offsetX + p.x;
+      var py = p.y;
+
+      // Piece outline
+      w('0'); w('LWPOLYLINE');
+      w('8'); w(layerName);
+      w('62'); w(aciColor);
+      w('90'); w('4');
+      w('70'); w('1');
+      dxfVertex(w, px, py);
+      dxfVertex(w, px + p.w, py);
+      dxfVertex(w, px + p.w, py + p.h);
+      dxfVertex(w, px, py + p.h);
+
+      // Piece label
+      w('0'); w('TEXT');
+      w('8'); w(layerName);
+      w('62'); w(aciColor);
+      w('10'); w(fmt(px + p.w / 2));
+      w('20'); w(fmt(py + p.h / 2 + 5));
+      w('30'); w('0');
+      w('40'); w(fmt(Math.max(5, Math.min(20, p.w / 8, p.h / 3))));
+      w('72'); w('1'); // centre-justified
+      w('11'); w(fmt(px + p.w / 2));
+      w('21'); w(fmt(py + p.h / 2 + 5));
+      w('1'); w(p.name || (p.w + 'x' + p.h));
+
+      // Dimensions line
+      w('0'); w('TEXT');
+      w('8'); w(layerName);
+      w('62'); w(aciColor);
+      w('10'); w(fmt(px + p.w / 2));
+      w('20'); w(fmt(py + p.h / 2 - 8));
+      w('30'); w('0');
+      w('40'); w(fmt(Math.max(4, Math.min(14, p.w / 10, p.h / 4))));
+      w('72'); w('1');
+      w('11'); w(fmt(px + p.w / 2));
+      w('21'); w(fmt(py + p.h / 2 - 8));
+      w('1'); w(p.w + 'x' + p.h + 'mm' + (p.rotated ? ' R' : ''));
+    });
+  });
+
+  w('0'); w('ENDSEC');
+  w('0'); w('EOF');
+
+  var content = lines.join('\n');
+  var blob = new Blob([content], { type: 'application/dxf' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'wood-cuts-' + Date.now() + '.dxf';
+  a.click();
+  toast('DXF exported');
+}
+
+function dxfVertex(w, x, y) {
+  w('10'); w(fmt(x));
+  w('20'); w(fmt(y));
+}
+
+function fmt(n) { return parseFloat(n.toFixed(4)).toString(); }
+
+function sanitizeDxfName(s) {
+  return s.replace(/[^A-Za-z0-9_\-]/g, '_').slice(0, 31) || 'PIECE';
 }
 
 function hexToRGB(hex){
